@@ -31,20 +31,52 @@ directions = []
 for kind, (source, target) in schemas.RELATION_SIGNATURES.items():
     directions.append(f"{source} -{kind}-> {target}")
 _DIRECTIONS = "\n".join(directions)
-_PROMPT = """Извлеки все явно описанные сущности и связи из одного фрагмента сервисного документа.
-Допустимые направления связей:
-""" + _DIRECTIONS + """
-В перечне установленных узлов обработай КАЖДУЮ строку: модель HAS_PART деталь,
-деталь IS_A узел и деталь SUPPLIED_BY поставщик. Линейку свяжи с моделью через BELONGS_TO.
-В таблице ошибок каждая ошибка INDICATES названный неисправный узел.
-В регламенте ошибка FIXED_BY регламент. FAILED извлекай только при фактически произошедшем отказе модели.
-В бюллетене направление REPLACED_BY идёт от снятой детали к её замене, даже если первой названа новая.
-Дефект партии сам по себе не означает замену. Не придумывай коды, не превращай номера отчётов в сущности.
-Названия узлов приводи к именительному падежу. Включи концы каждой связи в entities.
-Пример: «В AR-900 стоит контроллер P-9000» даёт Model AR-900, Component контроллер, Part P-9000 и две связи:
-{"subject_type":"Model","subject":"AR-900","type":"HAS_PART","object_type":"Part","object":"P-9000"}
-{"subject_type":"Part","subject":"P-9000","type":"IS_A","object_type":"Component","object":"контроллер"}.
-Пример задаёт формат. Верни JSON только о тексте пользователя."""
+
+
+def _extraction_prompt(chunk: Chunk, codes: set[str]) -> str:
+    if "## Состав узлов" in chunk.text:
+        part_count = sum(1 for code in codes if code_type(code) == "Part")
+        return f"""Извлеки сущности и связи из ведомости деталей. Схема направлений:
+{_DIRECTIONS}
+В тексте {part_count} артикулов. Заполни relations по группам:
+1. BELONGS_TO от модели к линейке.
+2. Все {part_count} связей HAS_PART. Один и тот же Model из заголовка слева, разные Part справа.
+3. Все {part_count} связей IS_A. Для каждого артикула возьми название узла из его строки.
+4. SUPPLIED_BY от каждого артикула к поставщику из той же строки.
+Пример для строки «контроллер — деталь P-9001, поставщик Завод» в руководстве GS-900:
+GS-900 HAS_PART P-9001; P-9001 IS_A контроллер; P-9001 SUPPLIED_BY Завод.
+В entities перечисли концы всех связей. Используй только сведения из документа."""
+    if chunk.doc_id.startswith("report_"):
+        return f"""Извлеки сущности и связи из отчёта о выезде. Схема направлений:
+{_DIRECTIONS}
+Для фактического отказа выпиши Model, ErrorCode и Component. Скопируй структуру примера,
+заменив значения полей subject и object на найденные в документе:
+{{"subject_type":"Model","subject":"GS-900","type":"FAILED","object_type":"Component","object":"контроллер"}}
+{{"subject_type":"ErrorCode","subject":"E-90","type":"INDICATES","object_type":"Component","object":"контроллер"}}
+В entities перечисли все сущности. Номер отчёта и город пропусти."""
+    if chunk.doc_id.startswith("bulletin_"):
+        return f"""Извлеки из бюллетеня сведения о деталях. Схема направлений:
+{_DIRECTIONS}
+Пример: «Деталь P-9001 (контроллер) снята, новая деталь P-9002. Её поставщик Завод».
+Записи в relations по этому примеру:
+{{"subject_type":"Part","subject":"P-9001","type":"IS_A","object_type":"Component","object":"контроллер"}}
+{{"subject_type":"Part","subject":"P-9001","type":"REPLACED_BY","object_type":"Part","object":"P-9002"}}
+{{"subject_type":"Part","subject":"P-9002","type":"SUPPLIED_BY","object_type":"Supplier","object":"Завод"}}
+Если поставщик сообщил о дефекте партии одного артикула, выпиши только IS_A и SUPPLIED_BY для этого артикула.
+В entities и relations копируй полные имена и артикулы из текста, включая последние цифры и буквы."""
+    if chunk.doc_id.startswith("procedure_"):
+        return f"""Извлеки из регламента сведения о диагностике и ремонте. Схема направлений:
+{_DIRECTIONS}
+Пример: регламент SP-901 устраняет ошибку E-90, указывающую на отказ контроллера.
+{{"subject_type":"ErrorCode","subject":"E-90","type":"FIXED_BY","object_type":"Procedure","object":"SP-901"}}
+{{"subject_type":"ErrorCode","subject":"E-90","type":"INDICATES","object_type":"Component","object":"контроллер"}}
+Обе связи начинаются с кода ошибки, выпиши его целиком. В entities включи концы связей.
+Если регламент описывает только плановые работы без ошибок, верни {{"entities":[],"relations":[]}}."""
+    return f"""Извлеки явно описанные сущности и связи. Схема направлений:
+{_DIRECTIONS}
+В таблице кодов каждая строка даёт связь ErrorCode INDICATES Component.
+Пример: «E-90 — отказ узла контроллер» даёт E-90 INDICATES контроллер.
+Перечисли все факты из документа, точно перепиши коды и названия в relations и entities."""
 
 
 def extract_chunk(chunk: Chunk, llm: LLMClient) -> ExtractionResult:
@@ -62,8 +94,9 @@ def extract_chunk(chunk: Chunk, llm: LLMClient) -> ExtractionResult:
     hints = [(code_type(code), code) for code in sorted(codes)]
     hints.extend(find_names(chunk.text, vocab))
     names = ", ".join(f"{kind}={name}" for kind, name in hints)
+    instruction = _extraction_prompt(chunk, codes)
     messages = [
-        {"role": "system", "content": _PROMPT},
+        {"role": "system", "content": instruction},
         {"role": "user", "content": f"Варианты написания обнаруженных имён: {names}\n\nДокумент:\n{chunk.text}"},
     ]
     result = ExtractionResult(chunk.chunk_id, chunk.doc_id)
