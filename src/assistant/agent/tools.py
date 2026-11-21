@@ -49,23 +49,38 @@ TOOL_SCHEMAS.extend(
 )
 
 
-def _with_validation(function: Callable, properties: dict) -> Callable:
-    def call(**args) -> dict:
-        if args.keys() != properties.keys():
-            return {"error": "Ожидаются аргументы: " + ", ".join(properties)}
-        for name, spec in properties.items():
-            value = args[name]
-            if spec["type"] == "string" and (not isinstance(value, str) or not value.strip()):
-                return {"error": f"Параметр {name} должен быть непустой строкой."}
-        if "part_id" in args and not re.fullmatch(PART_PATTERN, args["part_id"]):
-            return {"error": "Номер детали должен иметь вид P-1042 или P-1042B."}
-        if "warehouse" in args and args["warehouse"] not in WAREHOUSES:
-            return {"error": "Неизвестный склад. Допустимые склады: " + ", ".join(WAREHOUSES)}
-        if "qty" in args:
-            qty = args["qty"]
-            if type(qty) is not int or qty <= 0:
-                return {"error": "Количество должно быть целым числом больше нуля."}
+_PARAMETERS = {}
+for schema in TOOL_SCHEMAS:
+    spec = schema["function"]
+    _PARAMETERS[spec["name"]] = spec["parameters"]["properties"]
 
+
+def argument_error(tool: str, args: dict) -> str | None:
+    if tool not in _PARAMETERS:
+        return "Неизвестный инструмент."
+    properties = _PARAMETERS[tool]
+    if not isinstance(args, dict) or args.keys() != properties.keys():
+        return "Ожидаются аргументы: " + ", ".join(properties)
+    for name, spec in properties.items():
+        value = args[name]
+        if spec["type"] == "string" and (not isinstance(value, str) or not value.strip()):
+            return f"Параметр {name} должен быть непустой строкой."
+    if "part_id" in args and not re.fullmatch(PART_PATTERN, args["part_id"]):
+        return "Номер детали должен иметь вид P-1042 или P-1042B."
+    if "warehouse" in args and args["warehouse"] not in WAREHOUSES:
+        return "Неизвестный склад. Допустимые склады: " + ", ".join(WAREHOUSES)
+    if "qty" in args:
+        qty = args["qty"]
+        if type(qty) is not int or qty <= 0:
+            return "Количество должно быть целым числом больше нуля."
+    return None
+
+
+def _with_validation(tool: str, function: Callable) -> Callable:
+    def call(**args) -> dict:
+        error = argument_error(tool, args)
+        if error:
+            return {"error": error}
         try:
             return function(**args)
         except erp_client.ErpNotFound as exc:
@@ -102,9 +117,6 @@ def build_tools(kb: KnowledgeBase, llm: LLMClient, erp: ErpClient) -> dict[str, 
         "create_service_order": erp.create_order,
     }
     tools = {}
-    for schema in TOOL_SCHEMAS:
-        spec = schema["function"]
-        name = spec["name"]
-        properties = spec["parameters"]["properties"]
-        tools[name] = _with_validation(functions[name], properties)
+    for name, function in functions.items():
+        tools[name] = _with_validation(name, function)
     return tools
